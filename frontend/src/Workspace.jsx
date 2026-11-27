@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react'
 import VisualIntelligenceView from './VisualIntelligence.jsx'
+import LearningToolView from './LearningToolView.jsx'
 import './Workspace.css'
 
 const maxPdfSize = 20 * 1024 * 1024
@@ -19,6 +20,7 @@ const documentExtractUrl = 'http://127.0.0.1:8000/api/documents/extract'
 const documentSummarizeUrl = 'http://127.0.0.1:8000/api/documents/summarize'
 const completeSummaryUrl = 'http://127.0.0.1:8000/api/documents/summarize-complete'
 const documentVisualizeUrl = 'http://127.0.0.1:8000/api/documents/visualize'
+const documentLearnUrl = 'http://127.0.0.1:8000/api/documents/learn'
 const summaryReportUrl = 'http://127.0.0.1:8000/api/documents/summary-report'
 const maxCachedExtractionCharacters = 8 * 1024 * 1024
 const maxCachedDocuments = 20
@@ -28,6 +30,13 @@ const visualTools = [
   'Architecture Diagram',
   'Concept Map',
   'Process Visualization',
+]
+const learningTools = [
+  'Structured Notes',
+  'Flashcards',
+  'Quiz Generator',
+  'Beginner Explanation',
+  'Important Definitions',
 ]
 const completeSummaryModes = [
   { id: 'brief', tool: 'Brief Summary', label: 'Brief Summary' },
@@ -65,6 +74,26 @@ function getVisualizationError(error) {
   return 'We could not generate this visualization. Please try again.'
 }
 
+function getLearningError(error) {
+  if (!axios.isAxiosError(error)) {
+    return error instanceof Error && error.message.startsWith('The learning service returned')
+      ? error.message
+      : 'An unexpected error occurred while creating this learning material. Please try again.'
+  }
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return 'Learning material generation took too long and was stopped. Try again or use a shorter document.'
+  }
+  if (!error.response) {
+    return 'The learning service is unavailable. Make sure the backend is running and try again.'
+  }
+  const detail = error.response.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (error.response.status === 422) return 'This document does not contain enough readable text for this learning tool.'
+  if (error.response.status === 502) return 'Gemini returned invalid learning material. Please retry.'
+  if (error.response.status === 504) return 'Learning material generation timed out. Please try again.'
+  return 'We could not create this learning material. Please try again.'
+}
+
 function getSummaryModeLabel(mode) {
   return {
     brief: 'Brief Summary',
@@ -77,6 +106,15 @@ function getSummaryModeLabel(mode) {
 
 function getDocumentTextForMode(documentData, mode) {
   if (mode !== 'topic_skimming' || !Array.isArray(documentData.pages)) {
+    return documentData.extracted_text
+  }
+  return documentData.pages
+    .map((page) => `[PAGE ${page.page_number}]\n${page.text}`)
+    .join('\n\n')
+}
+
+function getDocumentTextForLearning(documentData) {
+  if (!Array.isArray(documentData.pages) || documentData.pages.length === 0) {
     return documentData.extracted_text
   }
   return documentData.pages
@@ -748,6 +786,9 @@ function Workspace() {
   const [visualResults, setVisualResults] = useState({})
   const [visualLoadingTools, setVisualLoadingTools] = useState([])
   const [visualErrors, setVisualErrors] = useState({})
+  const [learningResults, setLearningResults] = useState({})
+  const [learningLoadingTools, setLearningLoadingTools] = useState([])
+  const [learningErrors, setLearningErrors] = useState({})
   const [visualModeSelections, setVisualModeSelections] = useState({ documentData: null, modes: {} })
   const [completeSummaryRun, setCompleteSummaryRun] = useState(null)
   const [reportDownloading, setReportDownloading] = useState(false)
@@ -787,6 +828,9 @@ function Workspace() {
   const visualCache = useRef(new Map())
   const visualRequests = useRef(new Map())
   const visualRequestErrors = useRef(new Map())
+  const learningCache = useRef(new Map())
+  const learningRequests = useRef(new Map())
+  const learningRequestErrors = useRef(new Map())
   const requestVisualizationRef = useRef(null)
 
   useEffect(() => {
@@ -833,6 +877,8 @@ function Workspace() {
     setSummaryResults(Object.fromEntries(getCacheForDocument(summaryCache.current, documentData)))
     setVisualResults(Object.fromEntries(getCacheForDocument(visualCache.current, documentData)))
     setVisualErrors({})
+    setLearningResults(Object.fromEntries(getCacheForDocument(learningCache.current, documentData)))
+    setLearningErrors({})
   }
 
   function addFiles(fileList) {
@@ -860,6 +906,8 @@ function Workspace() {
     setSummaryError('')
     setVisualResults({})
     setVisualErrors({})
+    setLearningResults({})
+    setLearningErrors({})
     setCompleteSummaryRun(null)
     currentDocumentRef.current = null
     setUploadError('')
@@ -1015,6 +1063,82 @@ function Workspace() {
     }).finally(() => {
       documentRequests.delete(toolName)
       setVisualLoadingTools((tools) => tools.filter((item) => item !== toolName))
+    })
+
+    documentRequests.set(toolName, request)
+    return request
+  }
+
+  async function requestLearning(documentData, toolName, regenerate = false) {
+    if (!documentData || !learningTools.includes(toolName)) return null
+
+    const documentCache = getCacheForDocument(learningCache.current, documentData)
+    if (!regenerate && documentCache.has(toolName)) {
+      const cached = documentCache.get(toolName)
+      if (currentDocumentRef.current === documentData) {
+        setLearningResults((results) => ({ ...results, [toolName]: cached }))
+      }
+      setLearningErrors((errors) => ({ ...errors, [toolName]: '' }))
+      return cached
+    }
+
+    const documentRequests = getCacheForDocument(learningRequests.current, documentData)
+    if (documentRequests.has(toolName)) {
+      const result = await documentRequests.get(toolName)
+      if (result && currentDocumentRef.current === documentData) {
+        setLearningResults((results) => ({ ...results, [toolName]: result }))
+      }
+      return result
+    }
+
+    setLearningErrors((errors) => ({ ...errors, [toolName]: '' }))
+    setLearningLoadingTools((requests) => requests.some(
+      (pending) => pending.documentData === documentData && pending.tool === toolName,
+    ) ? requests : [...requests, { documentData, tool: toolName }])
+    const request = axios.post(documentLearnUrl, {
+      filename: documentData.filename,
+      extracted_text: getDocumentTextForLearning(documentData),
+      tool: toolName,
+      document_hash: documentData.document_hash,
+      regenerate,
+    }, { timeout: summaryRequestTimeoutMs }).then(({ data }) => {
+      if (!data || data.tool !== toolName || !data.learning_material) {
+        throw new Error('The learning service returned incomplete material. Please retry.')
+      }
+      const resultArray = {
+        'Structured Notes': data.learning_material?.sections,
+        Flashcards: data.learning_material?.cards,
+        'Quiz Generator': data.learning_material?.questions,
+        'Beginner Explanation': data.learning_material?.concepts,
+        'Important Definitions': data.learning_material?.definitions,
+      }[toolName]
+      if (!Array.isArray(resultArray) || resultArray.length === 0) {
+        throw new Error('The learning service returned incomplete material. Please retry.')
+      }
+      const generatedResult = { ...data, clientGeneratedAt: Date.now() }
+      documentCache.set(toolName, generatedResult)
+      getCacheForDocument(learningRequestErrors.current, documentData).delete(toolName)
+      if (currentDocumentRef.current === documentData) {
+        setLearningResults((results) => ({ ...results, [toolName]: generatedResult }))
+      }
+      return generatedResult
+    }).catch((error) => {
+      const message = getLearningError(error)
+      getCacheForDocument(learningRequestErrors.current, documentData).set(toolName, message)
+      console.warn('[Insight Forge] Learning request failed:', {
+        tool: toolName,
+        status: error.response?.status,
+        code: error.code,
+      })
+      if (currentDocumentRef.current === documentData) {
+        setLearningErrors((errors) => ({ ...errors, [toolName]: message }))
+      }
+      return null
+    }).finally(() => {
+      documentRequests.delete(toolName)
+      setLearningLoadingTools((requests) => requests.filter(
+        (pending) => pending.documentData !== documentData || pending.tool !== toolName,
+      ))
     })
 
     documentRequests.set(toolName, request)
@@ -1188,6 +1312,9 @@ function Workspace() {
     if (activePage === 'result' && extractedDocument && visualTools.includes(toolName)) {
       void requestVisualization(extractedDocument, toolName)
     }
+    if (activePage === 'result' && extractedDocument && learningTools.includes(toolName)) {
+      void requestLearning(extractedDocument, toolName)
+    }
   }
 
   async function submitPrompt(value = prompt) {
@@ -1251,6 +1378,8 @@ function Workspace() {
       await requestSummary(documentData, selectedToolRef.current)
     } else if (documentData && visualTools.includes(selectedToolRef.current)) {
       await requestVisualization(documentData, selectedToolRef.current)
+    } else if (documentData && learningTools.includes(selectedToolRef.current)) {
+      await requestLearning(documentData, selectedToolRef.current)
     }
   }
 
@@ -1264,6 +1393,9 @@ function Workspace() {
     setSummaryResults({})
     setSummaryLoadingModes([])
     setSummaryError('')
+    setLearningResults({})
+    setLearningLoadingTools([])
+    setLearningErrors({})
     setCompleteSummaryRun(null)
     setExportMessage('')
     setCopied(false)
@@ -1404,15 +1536,31 @@ function Workspace() {
     const visualizationTool = visualTools.includes(selectedTool)
     const visualResult = visualizationTool ? visualResults[selectedTool] : null
     const visualLoading = visualizationTool && visualLoadingTools.includes(selectedTool)
+    const learningTool = learningTools.includes(selectedTool)
+    const learningResult = learningTool ? learningResults[selectedTool] : null
+    const learningLoading = learningTool && learningLoadingTools.some(
+      (pending) => pending.documentData === extractedDocument && pending.tool === selectedTool,
+    )
     const showSummaryReader = Boolean(summaryMode && extractedDocument)
     const showVisualReader = Boolean(visualizationTool && extractedDocument)
+    const showLearningReader = learningTool
     const visualMode = visualModeSelections.documentData === extractedDocument
       ? visualModeSelections.modes[selectedTool] || '2d'
       : '2d'
     return (
       <motion.div className="result-view" initial={{ opacity: 0, y: 9 }} animate={{ opacity: 1, y: 0 }}>
         <div className="result-crumb"><button onClick={startNewChat}><ArrowLeft size={14} /> New exploration</button><span>/</span><span>{selectedTool}</span></div>
-        {showVisualReader
+        {showLearningReader
+          ? <LearningToolView
+            result={learningResult}
+            tool={selectedTool}
+            loading={learningLoading}
+            error={learningErrors[selectedTool] || ''}
+            hasDocument={Boolean(extractedDocument)}
+            onRetry={() => void requestLearning(extractedDocument, selectedTool)}
+            onRegenerate={() => void requestLearning(extractedDocument, selectedTool, true)}
+          />
+          : showVisualReader
           ? <>
             <VisualIntelligenceView
               result={visualResult}

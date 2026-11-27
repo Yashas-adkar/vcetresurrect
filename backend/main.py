@@ -19,6 +19,7 @@ from services.gemini_service import (
     get_gemini_service,
 )
 from services.report_pdf import build_research_report_pdf, sanitize_report_stem
+from services.learning_service import LearningTool, get_learning_service
 from services.visual_service import (
     MAX_VISUAL_SOURCE_CHARACTERS,
     VisualTool,
@@ -56,6 +57,7 @@ async def api_root() -> dict[str, object]:
             "/api/documents/summarize",
             "/api/documents/summarize-complete",
             "/api/documents/visualize",
+            "/api/documents/learn",
             "/api/documents/summary-report",
         ],
     }
@@ -105,6 +107,20 @@ class VisualAnalysisResponse(BaseModel):
     filename: str
     tool: VisualTool
     visualization: dict[str, object]
+
+
+class LearningRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    extracted_text: str = Field(min_length=1, max_length=MAX_SUMMARY_SOURCE_CHARACTERS)
+    tool: LearningTool
+    document_hash: str | None = Field(default=None, min_length=64, max_length=64, pattern="^[a-f0-9]{64}$")
+    regenerate: bool = False
+
+
+class LearningResponse(BaseModel):
+    filename: str
+    tool: LearningTool
+    learning_material: dict[str, object]
 
 
 class CompleteSummaryReportRequest(BaseModel):
@@ -476,6 +492,92 @@ async def visualize_document(
     except ValueError as error:
         logger.warning(
             "Visual request rejected: tool=%s duration_seconds=%.1f reason=%s",
+            request.tool,
+            time.perf_counter() - started_at,
+            str(error),
+        )
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/api/documents/learn", response_model=LearningResponse)
+async def generate_learning_material(request: LearningRequest) -> LearningResponse:
+    started_at = time.perf_counter()
+    logger.info(
+        "Learning request received: tool=%s extracted_chars=%d regenerate=%s",
+        request.tool,
+        len(request.extracted_text),
+        request.regenerate,
+    )
+    try:
+        result = await run_in_threadpool(
+            get_learning_service().generate,
+            safe_filename(request.filename),
+            request.extracted_text,
+            request.tool,
+            request.document_hash,
+            request.regenerate,
+        )
+        return LearningResponse(**result)
+    except GeminiConfigurationError as error:
+        logger.error(
+            "Learning request failed: stage=configuration tool=%s duration_seconds=%.1f",
+            request.tool,
+            time.perf_counter() - started_at,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is not configured. Add GEMINI_API_KEY to backend/.env and restart the backend.",
+        ) from error
+    except GeminiServiceError as error:
+        logger.error(
+            "Learning request failed: tool=%s duration_seconds=%.1f category=%s status=%s timed_out=%s",
+            request.tool,
+            time.perf_counter() - started_at,
+            error.category,
+            error.provider_code,
+            error.timed_out,
+        )
+        if error.timed_out:
+            raise HTTPException(
+                status_code=504,
+                detail="Learning material generation timed out. Retry or use a shorter document.",
+            ) from error
+        if error.category == "quota":
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini API quota is unavailable for this project/model. Check AI Studio limits or wait for quota to reset.",
+            ) from error
+        if error.category == "rate_limit":
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini is temporarily rate-limiting requests. Wait briefly, then retry.",
+            ) from error
+        if error.category in ("unauthorized", "forbidden"):
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini rejected the API key or project. Check GEMINI_API_KEY and Gemini API access.",
+            ) from error
+        if error.category == "model_unavailable":
+            raise HTTPException(
+                status_code=503,
+                detail="The configured Gemini model is unavailable to this project.",
+            ) from error
+        if error.category in ("unavailable", "network"):
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini is temporarily unavailable. Check your internet connection and try again.",
+            ) from error
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned invalid learning material. Retry this tool."
+                if error.category == "invalid_response"
+                else "Learning material generation failed. Please try again."
+            ),
+        ) from error
+    except ValueError as error:
+        logger.warning(
+            "Learning request rejected: tool=%s duration_seconds=%.1f reason=%s",
             request.tool,
             time.perf_counter() - started_at,
             str(error),
