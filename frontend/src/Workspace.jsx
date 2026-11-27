@@ -10,16 +10,105 @@ import {
   Search, Send, Settings, ShieldCheck, Sparkles, Sun, Table2, Tag, Trash2,
   X,
 } from 'lucide-react'
+import VisualIntelligenceView from './VisualIntelligence.jsx'
 import './Workspace.css'
 
 const maxPdfSize = 20 * 1024 * 1024
+const summaryRequestTimeoutMs = 250_000
 const documentExtractUrl = 'http://127.0.0.1:8000/api/documents/extract'
 const documentSummarizeUrl = 'http://127.0.0.1:8000/api/documents/summarize'
+const completeSummaryUrl = 'http://127.0.0.1:8000/api/documents/summarize-complete'
+const documentVisualizeUrl = 'http://127.0.0.1:8000/api/documents/visualize'
+const summaryReportUrl = 'http://127.0.0.1:8000/api/documents/summary-report'
+const maxCachedExtractionCharacters = 8 * 1024 * 1024
+const maxCachedDocuments = 20
+const visualTools = [
+  'Knowledge Graph',
+  'Flowchart',
+  'Architecture Diagram',
+  'Concept Map',
+  'Process Visualization',
+]
+const completeSummaryModes = [
+  { id: 'brief', tool: 'Brief Summary', label: 'Brief Summary' },
+  { id: 'detailed', tool: 'Detailed Summary', label: 'Detailed Summary' },
+  { id: 'topic_skimming', tool: 'Topic Skimming', label: 'Topic Skimming' },
+  { id: 'key_takeaways', tool: 'Key Takeaways', label: 'Key Takeaways' },
+  { id: 'executive_summary', tool: 'Executive Summary', label: 'Executive Summary' },
+]
 
 function getSummaryMode(tool) {
-  if (tool === 'Brief Summary') return 'brief'
-  if (tool === 'Detailed Summary') return 'detailed'
-  return null
+  return {
+    'Brief Summary': 'brief',
+    'Detailed Summary': 'detailed',
+    'Topic Skimming': 'topic_skimming',
+    'Key Takeaways': 'key_takeaways',
+    'Executive Summary': 'executive_summary',
+  }[tool] || null
+}
+
+function getVisualizationError(error) {
+  if (!axios.isAxiosError(error)) {
+    return 'An unexpected error occurred while generating this visualization. Please try again.'
+  }
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return 'Visualization generation took too long and was stopped. Try again or use a shorter document.'
+  }
+  if (!error.response) {
+    return 'The visualization service is unavailable. Make sure the backend is running and try again.'
+  }
+  const detail = error.response.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (error.response.status === 422) return 'This document does not contain enough readable text to visualize.'
+  if (error.response.status === 502) return 'Gemini returned invalid visualization data. Please retry.'
+  if (error.response.status === 504) return 'Visualization generation timed out. Please try again.'
+  return 'We could not generate this visualization. Please try again.'
+}
+
+function getSummaryModeLabel(mode) {
+  return {
+    brief: 'Brief Summary',
+    detailed: 'Detailed Summary',
+    topic_skimming: 'Topic Skimming',
+    key_takeaways: 'Key Takeaways',
+    executive_summary: 'Executive Summary',
+  }[mode] || 'Research Summary'
+}
+
+function getDocumentTextForMode(documentData, mode) {
+  if (mode !== 'topic_skimming' || !Array.isArray(documentData.pages)) {
+    return documentData.extracted_text
+  }
+  return documentData.pages
+    .map((page) => `[PAGE ${page.page_number}]\n${page.text}`)
+    .join('\n\n')
+}
+
+function getDocumentCacheKey(documentData) {
+  return documentData.document_hash || documentData
+}
+
+function getCacheForDocument(cache, documentData) {
+  const key = getDocumentCacheKey(documentData)
+  let documentCache = cache.get(key)
+  if (documentCache) {
+    cache.delete(key)
+    cache.set(key, documentCache)
+  } else {
+    documentCache = new Map()
+    cache.set(key, documentCache)
+    while (cache.size > maxCachedDocuments) {
+      cache.delete(cache.keys().next().value)
+    }
+  }
+  return documentCache
+}
+
+async function hashPdf(file) {
+  if (!globalThis.crypto?.subtle) return null
+  const content = await file.arrayBuffer()
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', content)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function getExtractionError(error) {
@@ -32,6 +121,7 @@ function getExtractionError(error) {
 
   const { status, data } = error.response
   const detail = typeof data?.detail === 'string' ? data.detail.toLowerCase() : ''
+  if (status === 413 && detail.includes('100-page')) return 'This PDF has more than 100 pages. Choose a shorter document.'
   if (status === 413) return 'This PDF is larger than 20 MB. Choose a smaller file.'
   if (status === 415) return 'Invalid PDF. Please choose a valid PDF document.'
   if (status === 422 && detail.includes('no extractable text')) {
@@ -50,16 +140,27 @@ function getExtractionError(error) {
 
 function getSummaryError(error) {
   if (!axios.isAxiosError(error)) {
-    return 'An unexpected error occurred while generating the summary. Please try again.'
+    return 'An unexpected error occurred while generating this result. Please try again.'
+  }
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return 'Summary generation took too long and was stopped. Try again or use a shorter document.'
   }
   if (!error.response) {
     return 'The summary service is unavailable. Make sure the backend is running and try again.'
   }
   if (error.response.status === 503) {
+    const detail = error.response.data?.detail
+    if (typeof detail === 'string' && detail.trim()) return detail
     return 'Research summarization is not configured on the backend.'
   }
   if (error.response.status === 422) {
     return error.response.data?.detail || 'The extracted document text could not be summarized.'
+  }
+  if (error.response.status === 502) {
+    return error.response.data?.detail || 'Gemini could not generate a valid summary.'
+  }
+  if (error.response.status === 504) {
+    return error.response.data?.detail || 'Summary generation timed out. Please try again.'
   }
   return 'We could not generate this summary. Please try again.'
 }
@@ -255,6 +356,39 @@ function SampleOutput({ tool }) {
 }
 
 function getSummarySections(summary, mode) {
+  if (mode === 'topic_skimming') {
+    return [
+      { id: 'overview', title: 'Paper Overview', type: 'text', content: summary.paper_overview, featured: true },
+      { id: 'topics', title: 'Main Topics', type: 'topics', content: summary.main_topics },
+      { id: 'structure', title: 'Research Structure', type: 'structure', content: summary.research_structure },
+      { id: 'priority-reading', title: 'Important Sections to Read', type: 'priority', content: summary.important_sections_to_read },
+      { id: 'keywords', title: 'Keywords', type: 'keywords', content: summary.keywords },
+    ]
+  }
+
+  if (mode === 'key_takeaways') {
+    return [
+      { id: 'core-message', title: 'Core Message', type: 'text', content: summary.core_message, featured: true },
+      { id: 'takeaways', title: 'Key Takeaways', type: 'takeaways', content: summary.key_takeaways },
+      { id: 'contributions', title: 'Major Contributions', type: 'contributions', content: summary.major_contributions },
+      { id: 'implications', title: 'Practical Implications', type: 'implications', content: summary.practical_implications },
+      { id: 'remember', title: 'What Should I Remember?', type: 'numbered', content: summary.what_to_remember },
+    ]
+  }
+
+  if (mode === 'executive_summary') {
+    return [
+      { id: 'context', title: 'Research Context', type: 'text', content: summary.research_context },
+      { id: 'problem', title: 'Problem', type: 'text', content: summary.problem, featured: true },
+      { id: 'approach', title: 'Approach', type: 'text', content: summary.approach },
+      { id: 'findings', title: 'Key Findings', type: 'findings', content: summary.key_findings },
+      { id: 'significance', title: 'Significance', type: 'text', content: summary.significance },
+      { id: 'limitations', title: 'Limitations and Considerations', type: 'list', content: summary.limitations_and_considerations },
+      { id: 'next-steps', title: 'Recommended Next Steps', type: 'recommendations', content: summary.recommended_next_steps },
+      { id: 'verdict', title: 'Final Verdict', type: 'text', content: summary.final_verdict, featured: true },
+    ]
+  }
+
   const sections = [
     { id: 'overview', title: 'Research Overview', type: 'text', content: summary.research_overview, featured: true },
     { id: 'problem', title: 'Problem Statement', type: 'text', content: summary.problem_statement },
@@ -296,7 +430,7 @@ function getSummaryMarkdown(summary, mode, documentData) {
     '',
     `**Source:** ${documentData.uploadedFilename || documentData.filename}`,
     `**Pages:** ${documentData.page_count}`,
-    `**Summary mode:** ${mode === 'brief' ? 'Brief Summary' : 'Detailed Summary'}`,
+    `**Analysis:** ${getSummaryModeLabel(mode)}`,
     '',
   ]
 
@@ -310,6 +444,30 @@ function getSummaryMarkdown(summary, mode, documentData) {
       section.content.forEach((finding) => lines.push(`- ${finding.finding}\n  - Evidence: ${finding.evidence}`))
     } else if (section.type === 'results') {
       section.content.forEach(([title, content]) => lines.push(`**${title}**\n\n${content}`))
+    } else if (section.type === 'topics') {
+      section.content.forEach((topic) => lines.push(
+        `- **${topic.title}**\n  - ${topic.explanation}\n  - Why it matters: ${topic.importance}\n  - Pages: ${formatPageNumbers(topic.page_numbers)}`,
+      ))
+    } else if (section.type === 'structure') {
+      section.content.forEach((item) => lines.push(
+        `- **${item.section}:** ${item.topics.join(', ')}${item.page_numbers.length ? ` (pages ${item.page_numbers.join(', ')})` : ''}`,
+      ))
+    } else if (section.type === 'priority') {
+      section.content.forEach((item) => lines.push(
+        `- **${item.title}:** ${item.why_read} — ${formatPageNumbers(item.page_numbers)}`,
+      ))
+    } else if (section.type === 'keywords') {
+      section.content.forEach((item) => lines.push(`- **${item.keyword}:** ${item.explanation}`))
+    } else if (section.type === 'takeaways') {
+      section.content.forEach((item, index) => lines.push(
+        `${index + 1}. **${item.title}**\n   ${item.explanation}\n   Why it matters: ${item.why_it_matters}`,
+      ))
+    } else if (section.type === 'contributions') {
+      section.content.forEach((item) => lines.push(`- **${item.contribution}:** ${item.significance}`))
+    } else if (section.type === 'implications') {
+      section.content.forEach((item) => lines.push(`- ${item.implication} (${item.basis})`))
+    } else if (section.type === 'recommendations') {
+      section.content.forEach((item) => lines.push(`- ${item.recommendation} (${item.basis})`))
     } else {
       lines.push(section.content)
     }
@@ -317,6 +475,10 @@ function getSummaryMarkdown(summary, mode, documentData) {
   })
 
   return lines.join('\n')
+}
+
+function formatPageNumbers(pageNumbers) {
+  return pageNumbers?.length ? `Pages ${pageNumbers.join(', ')}` : 'Page references unavailable'
 }
 
 function SummarySectionContent({ section }) {
@@ -367,36 +529,178 @@ function SummarySectionContent({ section }) {
       </div>
     )
   }
+  if (section.type === 'topics') {
+    return (
+      <div className="summary-concepts">
+        {section.content.map((topic, index) => (
+          <article className="summary-concept-card" key={`topic-${index}`}>
+            <b>{topic.title}</b>
+            <p>{topic.explanation}</p>
+            <p><strong>Why it matters:</strong> {topic.importance}</p>
+            <small className="summary-page-reference">{formatPageNumbers(topic.page_numbers)}</small>
+          </article>
+        ))}
+      </div>
+    )
+  }
+  if (section.type === 'structure') {
+    return (
+      <div className="summary-detail-cards">
+        {section.content.map((item, index) => (
+          <article className="summary-detail-card" key={`structure-${index}`}>
+            <b>{item.section}</b>
+            <p>{item.topics.join(' · ')}</p>
+            <small className="summary-page-reference">{formatPageNumbers(item.page_numbers)}</small>
+          </article>
+        ))}
+      </div>
+    )
+  }
+  if (section.type === 'priority') {
+    return (
+      <div className="summary-detail-cards">
+        {section.content.map((item, index) => (
+          <article className="summary-detail-card" key={`priority-${index}`}>
+            <b>{item.title}</b>
+            <p>{item.why_read}</p>
+            <small className="summary-page-reference">{formatPageNumbers(item.page_numbers)}</small>
+          </article>
+        ))}
+      </div>
+    )
+  }
+  if (section.type === 'keywords') {
+    return (
+      <div className="summary-concepts">
+        {section.content.map((item, index) => (
+          <article className="summary-concept-card" key={`keyword-${index}`}>
+            <b>{item.keyword}</b>
+            <p>{item.explanation}</p>
+          </article>
+        ))}
+      </div>
+    )
+  }
+  if (section.type === 'takeaways') {
+    return (
+      <div className="summary-findings">
+        {section.content.map((item, index) => (
+          <article className="summary-finding-card" key={`takeaway-${index}`}>
+            <span className="summary-finding-index">{String(index + 1).padStart(2, '0')}</span>
+            <div><b className="summary-card-title">{item.title}</b><p>{item.explanation}</p><small><b>Why it matters</b>{item.why_it_matters}</small></div>
+          </article>
+        ))}
+      </div>
+    )
+  }
+  if (section.type === 'contributions' || section.type === 'implications' || section.type === 'recommendations') {
+    return (
+      <div className="summary-detail-cards">
+        {section.content.map((item, index) => {
+          const title = item.contribution || item.implication || item.recommendation
+          const explanation = item.significance || item.basis
+          return (
+            <article className="summary-detail-card" key={`${section.type}-${index}`}>
+              <b>{title}</b>
+              {item.contribution && <p>{item.significance}</p>}
+              {item.implication && <small className="summary-page-reference">{item.basis}</small>}
+              {item.recommendation && <small className="summary-page-reference">{item.basis}</small>}
+              {!item.contribution && !item.implication && !item.recommendation && <p>{explanation}</p>}
+            </article>
+          )
+        })}
+      </div>
+    )
+  }
   return <p className={section.featured ? 'summary-overview-copy' : ''}>{section.content}</p>
 }
 
-function SummaryReadingView({ result, documentData, mode, loading, error, onRetry, onCopy, onDownload, onSave, isSaved, copied, exportMessage }) {
+function SummaryReadingView({
+  result,
+  documentData,
+  mode,
+  loading,
+  error,
+  onRetry,
+  onCopy,
+  onDownloadResult,
+  onSave,
+  isSaved,
+  copied,
+  exportMessage,
+  completeSummaryProgress,
+  completeSummaryStarted,
+  completeSummaryRunning,
+  onGenerateComplete,
+  reportReady,
+  reportDownloading,
+  onDownloadReport,
+}) {
   const summary = result?.summary
   const sections = summary ? getSummarySections(summary, mode) : []
-  const title = summary?.paper_title || 'Paper title unavailable in this summary'
   const filename = documentData?.uploadedFilename || result?.filename || 'Research paper'
+  const title = summary?.paper_title || filename || 'Research paper'
   const pageCount = documentData?.page_count
+  const hasFailedSections = completeSummaryProgress.some(({ status }) => status === 'failed')
+  const completeSummaryButtonText = completeSummaryStarted
+    ? hasFailedSections ? 'Retry Failed Sections' : 'Resume Incomplete Sections'
+    : 'Generate Complete Summary'
 
   return (
     <div className="summary-reading-view">
       <header className="summary-document-header">
         <div className="summary-document-title">
-          <span className="workspace-overline">RESEARCH PAPER · {mode === 'brief' ? 'BRIEF SUMMARY' : 'DETAILED SUMMARY'}</span>
+          <span className="workspace-overline">RESEARCH PAPER · {getSummaryModeLabel(mode).toUpperCase()}</span>
           <h1>{title}</h1>
           <div className="summary-document-meta">
             <span><FileText size={13} />{filename}</span>
             <i />
             <span>{pageCount ?? '—'} {pageCount === 1 ? 'page' : 'pages'}</span>
             <i />
-            <span>{mode === 'brief' ? 'Brief Summary' : 'Detailed Summary'}</span>
+            <span>{getSummaryModeLabel(mode)}</span>
           </div>
         </div>
         {result && <div className="summary-export-actions">
-          <button type="button" onClick={onCopy}><Copy size={14} />{copied ? 'Copied' : 'Copy Summary'}</button>
-          <button type="button" onClick={onDownload}><Download size={14} />Download Summary</button>
+          <button type="button" onClick={onCopy}><Copy size={14} />{copied ? 'Copied' : mode === 'brief' || mode === 'detailed' ? 'Copy Summary' : 'Copy Result'}</button>
+          <button type="button" onClick={onDownloadResult}><Download size={14} />{mode === 'brief' || mode === 'detailed' ? 'Download Summary' : 'Download Result'}</button>
           <button type="button" className={isSaved ? 'saved-action' : ''} onClick={onSave}>{isSaved ? <Check size={14} /> : <Bookmark size={14} />}{isSaved ? 'Saved' : 'Save'}</button>
         </div>}
       </header>
+      <section className="complete-summary-panel" aria-label="Complete summary report">
+        <div className="complete-summary-controls">
+          <div>
+            <b>Complete research analysis</b>
+            <small>Generate and keep all five analyses for this document.</small>
+          </div>
+          {!reportReady
+            ? <button type="button" className="complete-summary-button" disabled={completeSummaryRunning} onClick={onGenerateComplete}>
+              {completeSummaryRunning
+                ? <><span className="extraction-spinner" />Generating…</>
+                : completeSummaryButtonText}
+            </button>
+            : <button type="button" className="complete-summary-button" disabled={reportDownloading} onClick={onDownloadReport}>
+              {reportDownloading
+                ? <><span className="extraction-spinner" />Preparing PDF…</>
+                : <><Download size={14} />Download PDF</>}
+            </button>}
+        </div>
+        {completeSummaryStarted && <ol className="complete-summary-progress" aria-live="polite">
+          {completeSummaryProgress.map(({ mode, label, status, error: modeError }) => (
+            <li className={`complete-summary-step step-${status}`} key={mode}>
+              {status === 'completed'
+                ? <Check size={14} aria-label="Completed" />
+                : status === 'generating'
+                  ? <span className="extraction-spinner" aria-label="Generating" />
+                  : status === 'failed'
+                    ? <X size={14} aria-label="Failed" />
+                    : <span className="complete-summary-pending" aria-label="Pending" />}
+              <span>{label}</span>
+              <small>{status === 'completed' ? 'Complete' : status === 'generating' ? 'Generating' : status === 'failed' ? 'Failed' : 'Pending'}</small>
+              {modeError && <p role="alert">{modeError}</p>}
+            </li>
+          ))}
+        </ol>}
+      </section>
       {exportMessage && <p className="summary-export-message" role="status">{exportMessage}</p>}
       {sections.length > 0
         ? <>
@@ -422,7 +726,7 @@ function SummaryReadingView({ result, documentData, mode, loading, error, onRetr
         </>
         : <div className={`summary-generation-state${error ? ' has-error' : ''}`} role={error ? 'alert' : 'status'} aria-live="polite">
           {loading && <span className="extraction-spinner" />}
-          <span>{error || `Generating your ${mode} research summary...`}</span>
+          <span>{error || `Generating your ${getSummaryModeLabel(mode)}...`}</span>
           {error && <button type="button" onClick={onRetry}>Retry</button>}
         </div>}
     </div>
@@ -441,6 +745,12 @@ function Workspace() {
   const [summaryResults, setSummaryResults] = useState({})
   const [summaryLoadingModes, setSummaryLoadingModes] = useState([])
   const [summaryError, setSummaryError] = useState('')
+  const [visualResults, setVisualResults] = useState({})
+  const [visualLoadingTools, setVisualLoadingTools] = useState([])
+  const [visualErrors, setVisualErrors] = useState({})
+  const [visualModeSelections, setVisualModeSelections] = useState({ documentData: null, modes: {} })
+  const [completeSummaryRun, setCompleteSummaryRun] = useState(null)
+  const [reportDownloading, setReportDownloading] = useState(false)
   const [uploadError, setUploadError] = useState('')
   const [saved, setSaved] = useState([])
   const [history, setHistory] = useState(sampleHistory)
@@ -467,8 +777,17 @@ function Workspace() {
   const extractionInProgress = useRef(false)
   const selectedToolRef = useRef(selectedTool)
   const currentDocumentRef = useRef(null)
-  const summaryCache = useRef(new WeakMap())
-  const summaryRequests = useRef(new WeakMap())
+  const documentExtractionCache = useRef(new Map())
+  const documentExtractionCacheWeight = useRef(0)
+  const summaryCache = useRef(new Map())
+  const summaryRequests = useRef(new Map())
+  const summaryRequestErrors = useRef(new Map())
+  const completeSummaryInProgress = useRef(new Set())
+  const completeSummaryRequests = useRef(new Map())
+  const visualCache = useRef(new Map())
+  const visualRequests = useRef(new Map())
+  const visualRequestErrors = useRef(new Map())
+  const requestVisualizationRef = useRef(null)
 
   useEffect(() => {
     document.title = 'Insight Forge — Research Workspace'
@@ -481,6 +800,40 @@ function Workspace() {
     history: 'Chat history', saved: 'Saved knowledge', documents: 'My documents',
     skills: 'Skill analysis', settings: 'Settings',
   }[activePage]
+
+  function getCachedExtraction(documentHash) {
+    const entry = documentExtractionCache.current.get(documentHash)
+    if (!entry) return null
+    documentExtractionCache.current.delete(documentHash)
+    documentExtractionCache.current.set(documentHash, entry)
+    return entry.documentData
+  }
+
+  function cacheExtraction(documentData) {
+    const size = documentData.extracted_text.length
+      + documentData.pages.reduce((total, page) => total + page.text.length, 0)
+    if (size > maxCachedExtractionCharacters) return
+
+    const cache = documentExtractionCache.current
+    const key = documentData.document_hash
+    const previous = cache.get(key)
+    if (previous) documentExtractionCacheWeight.current -= previous.size
+    cache.delete(key)
+    cache.set(key, { documentData, size })
+    documentExtractionCacheWeight.current += size
+    while (documentExtractionCacheWeight.current > maxCachedExtractionCharacters) {
+      const oldestKey = cache.keys().next().value
+      const oldest = cache.get(oldestKey)
+      cache.delete(oldestKey)
+      documentExtractionCacheWeight.current -= oldest.size
+    }
+  }
+
+  function restoreDocumentResults(documentData) {
+    setSummaryResults(Object.fromEntries(getCacheForDocument(summaryCache.current, documentData)))
+    setVisualResults(Object.fromEntries(getCacheForDocument(visualCache.current, documentData)))
+    setVisualErrors({})
+  }
 
   function addFiles(fileList) {
     if (extractionInProgress.current) return
@@ -505,6 +858,9 @@ function Workspace() {
     setExtractedDocument(null)
     setSummaryResults({})
     setSummaryError('')
+    setVisualResults({})
+    setVisualErrors({})
+    setCompleteSummaryRun(null)
     currentDocumentRef.current = null
     setUploadError('')
   }
@@ -525,11 +881,7 @@ function Workspace() {
     const summaryMode = getSummaryMode(toolName)
     if (!documentData || !summaryMode) return null
 
-    let documentCache = summaryCache.current.get(documentData)
-    if (!documentCache) {
-      documentCache = new Map()
-      summaryCache.current.set(documentData, documentCache)
-    }
+    const documentCache = getCacheForDocument(summaryCache.current, documentData)
     if (documentCache.has(summaryMode)) {
       const cached = documentCache.get(summaryMode)
       if (currentDocumentRef.current === documentData) {
@@ -539,28 +891,63 @@ function Workspace() {
       return cached
     }
 
-    let documentRequests = summaryRequests.current.get(documentData)
-    if (!documentRequests) {
-      documentRequests = new Map()
-      summaryRequests.current.set(documentData, documentRequests)
-    }
+    const documentRequests = getCacheForDocument(summaryRequests.current, documentData)
     if (documentRequests.has(summaryMode)) {
-      return documentRequests.get(summaryMode)
+      const result = await documentRequests.get(summaryMode)
+      if (result && currentDocumentRef.current === documentData) {
+        setSummaryResults((results) => ({ ...results, [summaryMode]: result }))
+      }
+      return result
     }
 
+    const pendingComplete = completeSummaryRequests.current.get(getDocumentCacheKey(documentData))
+    if (pendingComplete) {
+      try {
+        await pendingComplete
+      } catch (error) {
+        if (currentDocumentRef.current === documentData) setSummaryError(getSummaryError(error))
+        return null
+      }
+      const generated = getCacheForDocument(summaryCache.current, documentData).get(summaryMode)
+      if (generated) {
+        if (currentDocumentRef.current === documentData) {
+          setSummaryResults((results) => ({ ...results, [summaryMode]: generated }))
+        }
+        return generated
+      }
+    }
+
+    const documentErrors = getCacheForDocument(summaryRequestErrors.current, documentData)
     setSummaryError('')
     setSummaryLoadingModes((requests) => [...requests, { documentData, summaryMode }])
     const request = axios.post(documentSummarizeUrl, {
       filename: documentData.filename,
-      extracted_text: documentData.extracted_text,
+      extracted_text: getDocumentTextForMode(documentData, summaryMode),
       summary_mode: summaryMode,
-    }).then(({ data }) => {
+      document_hash: documentData.document_hash,
+    }, { timeout: summaryRequestTimeoutMs }).then(({ data }) => {
       documentCache.set(summaryMode, data)
+      documentErrors.delete(summaryMode)
       if (currentDocumentRef.current === documentData) {
         setSummaryResults((results) => ({ ...results, [summaryMode]: data }))
+        setCompleteSummaryRun((previous) => {
+          if (previous?.documentData !== documentData || !previous.errors?.[summaryMode]) return previous
+          const errors = { ...previous.errors }
+          delete errors[summaryMode]
+          return {
+            ...previous,
+            statuses: { ...previous.statuses, [summaryMode]: 'completed' },
+            errors,
+          }
+        })
       }
       return data
     }).catch((error) => {
+      documentErrors.set(summaryMode, getSummaryError(error))
+      console.warn('[Insight Forge] Summary request failed:', {
+        status: error.response?.status,
+        code: error.code,
+      })
       if (currentDocumentRef.current === documentData && getSummaryMode(selectedToolRef.current) === summaryMode) {
         setSummaryError(getSummaryError(error))
       }
@@ -576,6 +963,219 @@ function Workspace() {
     return request
   }
 
+  async function requestVisualization(documentData, toolName) {
+    if (!documentData || !visualTools.includes(toolName)) return null
+
+    const documentCache = getCacheForDocument(visualCache.current, documentData)
+    if (documentCache.has(toolName)) {
+      const cached = documentCache.get(toolName)
+      if (currentDocumentRef.current === documentData) {
+        setVisualResults((results) => ({ ...results, [toolName]: cached }))
+      }
+      setVisualErrors((errors) => ({ ...errors, [toolName]: '' }))
+      return cached
+    }
+
+    const documentRequests = getCacheForDocument(visualRequests.current, documentData)
+    if (documentRequests.has(toolName)) {
+      const result = await documentRequests.get(toolName)
+      if (result && currentDocumentRef.current === documentData) {
+        setVisualResults((results) => ({ ...results, [toolName]: result }))
+      }
+      return result
+    }
+
+    setVisualErrors((errors) => ({ ...errors, [toolName]: '' }))
+    setVisualLoadingTools((tools) => tools.includes(toolName) ? tools : [...tools, toolName])
+    const request = axios.post(documentVisualizeUrl, {
+      filename: documentData.filename,
+      extracted_text: documentData.extracted_text,
+      tool: toolName,
+      document_hash: documentData.document_hash,
+    }, { timeout: summaryRequestTimeoutMs }).then(({ data }) => {
+      documentCache.set(toolName, data)
+      getCacheForDocument(visualRequestErrors.current, documentData).delete(toolName)
+      if (currentDocumentRef.current === documentData) {
+        setVisualResults((results) => ({ ...results, [toolName]: data }))
+      }
+      return data
+    }).catch((error) => {
+      const message = getVisualizationError(error)
+      const documentErrors = getCacheForDocument(visualRequestErrors.current, documentData)
+      documentErrors.set(toolName, message)
+      console.warn('[Insight Forge] Visualization request failed:', {
+        tool: toolName,
+        status: error.response?.status,
+        code: error.code,
+      })
+      if (currentDocumentRef.current === documentData) {
+        setVisualErrors((errors) => ({ ...errors, [toolName]: message }))
+      }
+      return null
+    }).finally(() => {
+      documentRequests.delete(toolName)
+      setVisualLoadingTools((tools) => tools.filter((item) => item !== toolName))
+    })
+
+    documentRequests.set(toolName, request)
+    return request
+  }
+
+  useEffect(() => {
+    requestVisualizationRef.current = requestVisualization
+  })
+  useEffect(() => {
+    if (activePage === 'result' && extractedDocument && visualTools.includes(selectedTool)) {
+      void requestVisualizationRef.current?.(extractedDocument, selectedTool)
+    }
+  }, [activePage, extractedDocument, selectedTool])
+
+  function getCompleteSummaryStatus(documentData, mode) {
+    if (summaryResults[mode]) return 'completed'
+    if (completeSummaryRun?.documentData === documentData) {
+      return completeSummaryRun.statuses[mode] || 'pending'
+    }
+    return 'pending'
+  }
+
+  async function generateCompleteSummary(documentData = extractedDocument) {
+    if (!documentData) return
+    const documentKey = getDocumentCacheKey(documentData)
+    if (completeSummaryInProgress.current.has(documentKey)) return
+
+    completeSummaryInProgress.current.add(documentKey)
+    const documentCache = getCacheForDocument(summaryCache.current, documentData)
+    setExportMessage('')
+    setSummaryError('')
+    setCompleteSummaryRun((previous) => {
+      const previousStatuses = previous?.documentData === documentData ? previous.statuses : {}
+      const statuses = Object.fromEntries(completeSummaryModes.map(({ id }) => [
+        id,
+        documentCache.has(id) ? 'completed' : previousStatuses[id] === 'completed' ? 'completed' : 'pending',
+      ]))
+      return { documentData, statuses, running: true }
+    })
+
+    const updateStatus = (mode, status, error = '') => {
+      if (currentDocumentRef.current !== documentData) return
+      setCompleteSummaryRun((previous) => {
+        if (previous?.documentData !== documentData) return previous
+        const errors = { ...previous.errors }
+        if (error) errors[mode] = error
+        else delete errors[mode]
+        return {
+          ...previous,
+          statuses: { ...previous.statuses, [mode]: status },
+          errors,
+        }
+      })
+    }
+
+    try {
+      const activeSummaryRequests = [...getCacheForDocument(summaryRequests.current, documentData).entries()]
+      for (const [mode] of activeSummaryRequests) updateStatus(mode, 'generating')
+      if (activeSummaryRequests.length) {
+        await Promise.all(activeSummaryRequests.map(([, request]) => request))
+      }
+      const missingModes = completeSummaryModes.filter(({ id }) => !documentCache.has(id))
+      if (missingModes.length === 0) return
+      for (const { id } of missingModes) updateStatus(id, 'generating')
+
+      const request = axios.post(completeSummaryUrl, {
+        filename: documentData.filename,
+        extracted_text: documentData.extracted_text,
+        document_hash: documentData.document_hash,
+      }, { timeout: summaryRequestTimeoutMs })
+      completeSummaryRequests.current.set(documentKey, request)
+      let data
+      try {
+        ({ data } = await request)
+      } finally {
+        completeSummaryRequests.current.delete(documentKey)
+      }
+      for (const { id } of completeSummaryModes) {
+        const result = data.summaries?.[id]
+        if (result) {
+          documentCache.set(id, result)
+          if (currentDocumentRef.current === documentData) {
+            setSummaryResults((results) => ({ ...results, [id]: result }))
+          }
+          updateStatus(id, 'completed')
+        } else {
+          updateStatus(id, 'failed', 'Gemini did not return this section. Retry it individually.')
+        }
+      }
+      const reportedMissing = Array.isArray(data.missing_modes) ? data.missing_modes : []
+      for (const mode of reportedMissing) {
+        if (completeSummaryModes.some(({ id }) => id === mode) && !documentCache.has(mode)) {
+          updateStatus(mode, 'failed', 'Gemini did not return this section. Retry it individually.')
+        }
+      }
+    } catch (error) {
+      const message = getSummaryError(error)
+      for (const { id } of completeSummaryModes) {
+        if (!documentCache.has(id)) updateStatus(id, 'failed', message)
+      }
+    } finally {
+      completeSummaryInProgress.current.delete(documentKey)
+      if (currentDocumentRef.current === documentData) {
+        setCompleteSummaryRun((previous) => previous?.documentData === documentData
+          ? { ...previous, running: false }
+          : previous)
+      }
+    }
+  }
+
+  async function downloadCompleteSummaryPdf(documentData = extractedDocument) {
+    if (!documentData || reportDownloading) return
+    const cache = getCacheForDocument(summaryCache.current, documentData)
+    const missing = completeSummaryModes.filter(({ id }) => !cache?.has(id))
+    if (missing.length) {
+      setExportMessage(`Generate all sections before downloading. Missing: ${missing.map(({ label }) => label).join(', ')}.`)
+      return
+    }
+
+    setReportDownloading(true)
+    setExportMessage('')
+    try {
+      const summaries = completeSummaryModes.map(({ id }) => cache.get(id))
+      const { data } = await axios.post(summaryReportUrl, {
+        filename: documentData.filename,
+        summaries,
+      }, { responseType: 'blob', timeout: 45_000 })
+      if (!(data instanceof Blob) || data.size === 0 || data.type !== 'application/pdf') {
+        throw new Error('The report service returned an empty or invalid PDF.')
+      }
+      const blobUrl = URL.createObjectURL(data)
+      const link = document.createElement('a')
+      const baseName = (documentData.uploadedFilename || documentData.filename || 'Research_Paper')
+        .replace(/\.pdf$/i, '')
+        .normalize('NFKD')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80) || 'Research_Paper'
+      link.href = blobUrl
+      link.download = `InsightForge_Research_Report_${baseName}.pdf`
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0)
+    } catch (error) {
+      let message = 'The research report PDF could not be generated. Please try again.'
+      if (axios.isAxiosError(error) && error.response?.data instanceof Blob) {
+        try {
+          const errorBody = JSON.parse(await error.response.data.text())
+          if (typeof errorBody.detail === 'string') message = errorBody.detail
+        } catch {
+          message = 'The report service returned an unreadable error. Please try again.'
+        }
+      } else if (error instanceof Error && !axios.isAxiosError(error)) {
+        message = error.message
+      }
+      setExportMessage(message)
+    } finally {
+      setReportDownloading(false)
+    }
+  }
+
   function handleToolSelect(toolName) {
     selectedToolRef.current = toolName
     setSelectedTool(toolName)
@@ -584,6 +1184,9 @@ function Workspace() {
     setCopied(false)
     if (activePage === 'result' && extractedDocument && getSummaryMode(toolName)) {
       void requestSummary(extractedDocument, toolName)
+    }
+    if (activePage === 'result' && extractedDocument && visualTools.includes(toolName)) {
+      void requestVisualization(extractedDocument, toolName)
     }
   }
 
@@ -600,20 +1203,38 @@ function Workspace() {
       extractionInProgress.current = true
       setIsExtracting(true)
       setUploadError('')
-      const formData = new FormData()
-      formData.append('file', attachments[0])
 
       try {
-        const { data } = await axios.post(documentExtractUrl, formData)
-        documentData = {
-          ...data,
-          uploadedFilename: attachments[0].name,
-          fileSize: attachments[0].size,
+        const file = attachments[0]
+        const fileHash = await hashPdf(file)
+        const cachedExtraction = fileHash ? getCachedExtraction(fileHash) : null
+        if (cachedExtraction) {
+          documentData = {
+            ...cachedExtraction,
+            uploadedFilename: file.name,
+            fileSize: file.size,
+          }
+        } else {
+          const formData = new FormData()
+          formData.append('file', file)
+          const { data } = await axios.post(documentExtractUrl, formData)
+          if (fileHash && data.document_hash !== fileHash) {
+            throw new Error('The extracted document did not match the uploaded PDF. Please retry.')
+          }
+          documentData = {
+            ...data,
+            uploadedFilename: file.name,
+            fileSize: file.size,
+          }
+          if (data.document_hash) cacheExtraction(documentData)
         }
         currentDocumentRef.current = documentData
         setExtractedDocument(documentData)
+        restoreDocumentResults(documentData)
       } catch (error) {
-        setUploadError(getExtractionError(error))
+        setUploadError(error instanceof Error && !axios.isAxiosError(error)
+          ? error.message
+          : getExtractionError(error))
         return
       } finally {
         extractionInProgress.current = false
@@ -628,6 +1249,8 @@ function Workspace() {
     setActivePage('result')
     if (documentData && getSummaryMode(selectedToolRef.current)) {
       await requestSummary(documentData, selectedToolRef.current)
+    } else if (documentData && visualTools.includes(selectedToolRef.current)) {
+      await requestVisualization(documentData, selectedToolRef.current)
     }
   }
 
@@ -641,11 +1264,10 @@ function Workspace() {
     setSummaryResults({})
     setSummaryLoadingModes([])
     setSummaryError('')
+    setCompleteSummaryRun(null)
     setExportMessage('')
     setCopied(false)
     currentDocumentRef.current = null
-    summaryCache.current = new WeakMap()
-    summaryRequests.current = new WeakMap()
     selectedToolRef.current = 'Brief Summary'
     setUploadError('')
     setSelectedTool('Brief Summary')
@@ -698,7 +1320,7 @@ function Workspace() {
         .replace(/[<>:"/\\|?*]/g, '-')
         .trim() || 'research-summary'
       link.href = blobUrl
-      link.download = `${baseName}-${summaryMode}-summary.md`
+      link.download = `${baseName}-${summaryMode.replaceAll('_', '-')}.md`
       link.click()
       window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0)
       setExportMessage('')
@@ -763,7 +1385,7 @@ function Workspace() {
             </div>
           </div>
         </div>
-        <div className="composer-hint"><span><span className="hint-dot" />PRIVATE BY DESIGN</span><i /> PDFs are sent to the local API for text extraction.</div>
+        <div className="composer-hint"><span><span className="hint-dot" />GEMINI AI PROCESSING</span><i /> Extracted PDF text is sent to Google Gemini for summarization.</div>
         <div className="suggestion-label">A FEW PLACES TO BEGIN</div>
         <div className="suggestion-grid">
           {[['How does machine learning work?', Sparkles], ['Compare two research approaches', GitCompareArrows], ['Map the ideas in my paper', Network]].map(([text, Icon]) => <button type="button" key={text} onClick={() => { setPrompt(text); textareaRef.current?.focus() }}><Icon size={14} /><span>{text}</span><ArrowRight size={13} /></button>)}
@@ -779,11 +1401,38 @@ function Workspace() {
     const summaryLoading = summaryMode && summaryLoadingModes.some(
       (pending) => pending.documentData === extractedDocument && pending.summaryMode === summaryMode,
     )
+    const visualizationTool = visualTools.includes(selectedTool)
+    const visualResult = visualizationTool ? visualResults[selectedTool] : null
+    const visualLoading = visualizationTool && visualLoadingTools.includes(selectedTool)
     const showSummaryReader = Boolean(summaryMode && extractedDocument)
+    const showVisualReader = Boolean(visualizationTool && extractedDocument)
+    const visualMode = visualModeSelections.documentData === extractedDocument
+      ? visualModeSelections.modes[selectedTool] || '2d'
+      : '2d'
     return (
       <motion.div className="result-view" initial={{ opacity: 0, y: 9 }} animate={{ opacity: 1, y: 0 }}>
         <div className="result-crumb"><button onClick={startNewChat}><ArrowLeft size={14} /> New exploration</button><span>/</span><span>{selectedTool}</span></div>
-        {showSummaryReader
+        {showVisualReader
+          ? <>
+            <VisualIntelligenceView
+              result={visualResult}
+              tool={selectedTool}
+              mode={visualMode}
+              onModeChange={(mode) => setVisualModeSelections((previous) => ({
+                documentData: extractedDocument,
+                modes: {
+                  ...(previous.documentData === extractedDocument ? previous.modes : {}),
+                  [selectedTool]: mode,
+                },
+              }))}
+              loading={visualLoading}
+              error={visualErrors[selectedTool] || ''}
+              onRetry={() => void requestVisualization(extractedDocument, selectedTool)}
+            />
+            <form className="followup-composer" onSubmit={sendFollowup}><MessageCircle size={16} /><input value={followup} onChange={(event) => setFollowup(event.target.value)} placeholder="Ask a follow-up or explore another angle..." aria-label="Ask a follow-up" /><button type="submit" disabled={!followup.trim()} aria-label="Send follow-up"><Send size={16} /></button></form>
+            <p className="followup-note">Visualizations are generated from the extracted research paper.</p>
+          </>
+          : showSummaryReader
           ? <>
             <SummaryReadingView
               result={summaryResult}
@@ -793,11 +1442,25 @@ function Workspace() {
               error={summaryError}
               onRetry={() => void requestSummary(extractedDocument, selectedTool)}
               onCopy={copyResult}
-              onDownload={downloadSummary}
+              onDownloadResult={downloadSummary}
               onSave={toggleSave}
               isSaved={isSaved}
               copied={copied}
               exportMessage={exportMessage}
+              completeSummaryProgress={completeSummaryModes.map(({ id, label }) => ({
+                mode: id,
+                label,
+                status: getCompleteSummaryStatus(extractedDocument, id),
+                error: completeSummaryRun?.documentData === extractedDocument
+                  ? completeSummaryRun.errors?.[id]
+                  : '',
+              }))}
+              completeSummaryStarted={completeSummaryRun?.documentData === extractedDocument}
+              completeSummaryRunning={completeSummaryRun?.documentData === extractedDocument && completeSummaryRun.running}
+              onGenerateComplete={() => void generateCompleteSummary(extractedDocument)}
+              reportReady={completeSummaryModes.every(({ id }) => getCompleteSummaryStatus(extractedDocument, id) === 'completed')}
+              reportDownloading={reportDownloading}
+              onDownloadReport={() => void downloadCompleteSummaryPdf(extractedDocument)}
             />
             <form className="followup-composer" onSubmit={sendFollowup}><MessageCircle size={16} /><input value={followup} onChange={(event) => setFollowup(event.target.value)} placeholder="Ask a follow-up or explore another angle..." aria-label="Ask a follow-up" /><button type="submit" disabled={!followup.trim()} aria-label="Send follow-up"><Send size={16} /></button></form>
             <p className="followup-note">Follow-up responses are demo-only and do not represent generated research.</p>
